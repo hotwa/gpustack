@@ -1,6 +1,7 @@
 #!/bin/sh
 # Script updated at: 2025-04-24T06:27:59Z
 set -e
+#set -x
 set -o noglob
 
 # Usage:
@@ -269,16 +270,39 @@ check_and_reset_wired_limit_mb() {
 # Function to check and install Python tools
 PYTHONPATH=""
 check_python_tools() {
-  if ! check_command "python3"; then
-    info "Python3 could not be found. Attempting to install..."
+  # 强制安装并使用 Python 3.12
+  if ! check_command "python3.12"; then
+    info "Python 3.12 not found. Installing Python 3.12..."
     if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
-      $SUDO apt update && $SUDO DEBIAN_FRONTEND=noninteractive apt install -y python3
-    elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "rocky" ] ; then
-      $SUDO yum install -y python3
+      # 为了安装 3.12，先加 deadsnakes PPA（以 Debian/Ubuntu 为例）
+      $SUDO apt update
+      $SUDO DEBIAN_FRONTEND=noninteractive apt install -y software-properties-common
+      $SUDO add-apt-repository -y ppa:deadsnakes/ppa
+      $SUDO apt update
+      $SUDO DEBIAN_FRONTEND=noninteractive apt install -y python3.12 python3.12-venv python3.12-distutils
+    elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "rocky" ]; then
+      # EPEL + 科学软件源，示例仅供参考，具体视发行版而定
+      $SUDO yum install -y centos-release-scl
+      $SUDO yum install -y rh-python312
+      # 启用 scl
+      source /opt/rh/rh-python312/enable
     elif [ "$OS" = "macos" ]; then
       brew install python@3.12
     else
-      fatal "Unsupported OS for automatic Python installation. Please install Python3 manually."
+      fatal "Unsupported OS for automatic Python 3.12 installation. Please install Python 3.12 manually."
+    fi
+  fi
+
+  # 将 python3 链接到 python3.12
+  if check_command "python3.12"; then
+    PYBIN=$(which python3.12)
+    # 在 Debian/Ubuntu 上使用 update-alternatives
+    if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
+      $SUDO update-alternatives --install /usr/bin/python3 python3 $PYBIN 2
+      $SUDO update-alternatives --set python3 $PYBIN
+    else
+      # 其他系统直接软链接
+      $SUDO ln -sf "$PYBIN" /usr/local/bin/python3
     fi
   fi
 
@@ -337,7 +361,25 @@ check_python_tools() {
     elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "rocky" ] ; then
       $SUDO yum install -y pipx
     elif [ "$OS" = "macos" ]; then
-      brew install pipx
+      info "macOS: 使用 python3.12 安装 pipx 到用户目录…"
+      # 确保有 python3.12
+      if ! command -v python3.12 >/dev/null 2>&1; then
+        fatal "未检测到 python3.12，请先 brew install python@3.12 并 brew link"
+      fi
+      # 安装 pipx 到 ~/.local 或 ~/Library/Python/3.12/bin
+      python3.12 -m pip install --upgrade --user --break-system-packages pipx
+  
+      # 把 pipx 脚本所在的目录加到 zsh 的 PATH 里
+      SHELL_RC="$HOME/.zshrc"
+      PIPX_BIN_DIR="$HOME/Library/Python/3.12/bin"
+      if ! grep -qF "$PIPX_BIN_DIR" "$SHELL_RC"; then
+        echo "" >> "$SHELL_RC"
+        echo "# pipx via python3.12" >> "$SHELL_RC"
+        echo "export PATH=\"$PIPX_BIN_DIR:\$PATH\"" >> "$SHELL_RC"
+        info "已将 $PIPX_BIN_DIR 加入到 $SHELL_RC"
+      fi
+      # 立刻在当前 shell 生效
+      export PATH="$PIPX_BIN_DIR:$PATH"
     else
       fatal "Unsupported OS for automatic pipx installation. Please install pipx manually."
     fi
@@ -707,44 +749,28 @@ EOF
 
 # Function to install GPUStack using pipx
 install_gpustack() {
-  if check_command "gpustack"; then
-    ACTION="Upgrade"
-    info "GPUStack is already installed. Upgrading..."
-  else
-    info "Installing GPUStack..."
+  VENV_DIR="$HOME/.local/gpustack-venv"
+
+  # 如果已经存在旧 venv，就先删掉
+  if [ -d "$VENV_DIR" ]; then
+    info "Removing old venv at $VENV_DIR…"
+    rm -rf "$VENV_DIR"
   fi
 
-  install_args=""
-  if [ -n "$INSTALL_INDEX_URL" ]; then
-    install_args="--index-url $INSTALL_INDEX_URL $install_args"
-  fi
+  info "Creating Python 3.12 venv at $VENV_DIR…"
+  /opt/homebrew/bin/python3.12 -m venv "$VENV_DIR"
 
-  default_package_spec="gpustack[audio]"
-  if [ "$OS" != "macos" ] && [ "$(uname -m)" = "x86_64" ] && [ "$DEVICE" = "cuda" ]; then
-    # Install optional vLLM dependencies on amd64 Linux
-    default_package_spec="gpustack[all]"
-  fi
+  PIP="$VENV_DIR/bin/pip"
+  GPUSTACK_BIN="$VENV_DIR/bin/gpustack"
 
-  if [ -z "$INSTALL_PACKAGE_SPEC" ]; then
-    INSTALL_PACKAGE_SPEC="$default_package_spec"
-  fi
+  info "Upgrading pip, setuptools and wheel…"
+  "$PIP" install --upgrade pip setuptools wheel
 
-  # shellcheck disable=SC2090,SC2086
-  pipx install --force --verbose $install_args --python "$(which python3)" "$INSTALL_PACKAGE_SPEC"
-  # Workaround for issue #581
-  pipx inject gpustack pydantic==2.9.2 --force > /dev/null 2>&1
+  info "Installing GPUStack and audio extras…"
+  "$PIP" install "gpustack[audio]"
 
-  # audio dependencies for macOS
-  if [ "$INSTALL_SKIP_BUILD_DEPENDENCIES" != "1" ] && [ "$OS" = "macos" ]; then
-    # Check current installed versions
-    NEED_VERSION=$(brew list --versions | grep "$BREW_APP_OPENFST_NAME" | grep "$BREW_APP_OPENFST_VERSION" | cut -d ' ' -f 1 || true)
-    CPLUS_INCLUDE_PATH="$(brew --prefix "$NEED_VERSION")/include"
-    export CPLUS_INCLUDE_PATH
-    LIBRARY_PATH="$(brew --prefix "$NEED_VERSION")/lib"
-    export LIBRARY_PATH
-    pipx inject gpustack pynini==2.1.6
-    pipx inject gpustack wetextprocessing==1.0.4.1
-  fi
+  info "Linking gpustack executable to /usr/local/bin…"
+  sudo ln -sf "$GPUSTACK_BIN" /usr/local/bin/gpustack
 }
 
 # Main install process
